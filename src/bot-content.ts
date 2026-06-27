@@ -120,9 +120,9 @@ export function resolveFeishuGroupSession(params: {
   });
   const isTopicScope = isFeishuTopicSessionScope(groupSessionScope);
   const nativeTopicId =
-    chatType === "topic_group"
+    chatType === "topic_group" || isTopicScope
       ? (normalizedThreadId ?? normalizedRootId)
-      : (normalizedRootId ?? (isTopicScope ? normalizedThreadId : undefined));
+      : normalizedRootId;
   const topicScope = isTopicScope ? (nativeTopicId ?? (replyInThread ? messageId : null)) : null;
 
   let peerId;

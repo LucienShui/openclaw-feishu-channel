@@ -5,7 +5,7 @@ import {
 } from "openclaw/plugin-sdk/command-primitives-runtime";
 import type { ClawdbotConfig } from "../runtime-api.js";
 import { resolveFeishuAccount } from "./accounts.js";
-import { resolveFeishuGroupSession } from "./bot-content.js";
+import { normalizeFeishuCommandProbeBody, resolveFeishuGroupSession } from "./bot-content.js";
 import { parseFeishuMessageEvent, type FeishuMessageEvent } from "./bot.js";
 import { resolveFeishuGroupConfig } from "./policy.js";
 import { isFeishuGroupChatType } from "./types.js";
@@ -37,7 +37,9 @@ export function getFeishuSequentialKey(params: {
       })
     : null;
   const baseKey = `feishu:${accountId}:${groupSession?.peerId ?? chatId}`;
-  const text = parsed.content.trim();
+  const text = isFeishuGroupChatType(parsed.chatType)
+    ? normalizeFeishuCommandProbeBody(parsed.content)
+    : parsed.content.trim();
 
   if (isAbortRequestText(text)) {
     return `${baseKey}:control`;
