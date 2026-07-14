@@ -1,27 +1,15 @@
 // Feishu plugin module implements monitor.message handler behavior.
 import { isRecord, readStringValue as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ClawdbotConfig, HistoryEntry, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
-import { resolveFeishuAccount } from "./accounts.js";
-import {
-  isFeishuTopicSessionScope,
-  resolveConfiguredFeishuGroupSessionScope,
-} from "./bot-content.js";
 import { resolveFeishuMessageDedupeKey } from "./dedupe-key.js";
 import type { FeishuMessageEvent } from "./event-types.js";
 import { isMentionForwardRequest } from "./mention.js";
-import { resolveFeishuGroupConfig } from "./policy.js";
 import {
   releaseFeishuMessageProcessing,
   tryBeginFeishuMessageProcessing,
 } from "./processing-claims.js";
 import { createSequentialQueue } from "./sequential-queue.js";
-import type { FeishuChatType, FeishuMessageInfo } from "./types.js";
-
-type FeishuMessageFetcher = (params: {
-  cfg: ClawdbotConfig;
-  messageId: string;
-  accountId?: string;
-}) => Promise<FeishuMessageInfo | null>;
+import type { FeishuChatType } from "./types.js";
 
 type FeishuMessageReceiveHandlerContext = {
   cfg: ClawdbotConfig;
@@ -59,101 +47,24 @@ type FeishuMessageReceiveHandlerContext = {
   ) => Promise<boolean>;
   getBotOpenId?: (accountId: string) => string | undefined;
   getBotName?: (accountId: string) => string | undefined;
-  fetchMessage?: FeishuMessageFetcher;
   resolveSequentialKey?: (params: {
-    cfg: ClawdbotConfig;
     accountId: string;
     event: FeishuMessageEvent;
     botOpenId?: string;
     botName?: string;
   }) => string;
+  /**
+   * Optional status sink. When provided, the handler will publish `lastEventAt`
+   * on every inbound message for message recency. Transport liveness is
+   * published by the transport layer.
+   */
+  statusSink?: import("./monitor.js").FeishuStatusSink;
 };
 
 function normalizeFeishuChatType(value: unknown): FeishuChatType | undefined {
   return value === "group" || value === "topic_group" || value === "private" || value === "p2p"
     ? value
     : undefined;
-}
-
-function resolveFeishuProcessingClaimKey(params: {
-  event: FeishuMessageEvent;
-  messageDedupeKey?: string;
-}): string | undefined {
-  const messageId = params.event.message.message_id?.trim();
-  return params.messageDedupeKey && params.messageDedupeKey !== messageId
-    ? params.messageDedupeKey
-    : messageId;
-}
-
-function shouldHydrateFeishuTopicThreadIdForQueue(params: {
-  cfg: ClawdbotConfig;
-  accountId: string;
-  event: FeishuMessageEvent;
-}): boolean {
-  if (params.event.message.chat_type !== "topic_group" || params.event.message.thread_id?.trim()) {
-    return false;
-  }
-  const chatId = params.event.message.chat_id?.trim();
-  if (!chatId) {
-    return false;
-  }
-  const feishuCfg = resolveFeishuAccount({ cfg: params.cfg, accountId: params.accountId }).config;
-  const groupConfig = resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: chatId });
-  return isFeishuTopicSessionScope(
-    resolveConfiguredFeishuGroupSessionScope({
-      groupConfig,
-      feishuCfg,
-      chatType: params.event.message.chat_type,
-    }),
-  );
-}
-
-function buildPendingTopicChatKey(event: FeishuMessageEvent): string | null {
-  if (event.message.chat_type !== "topic_group") {
-    return null;
-  }
-  return event.message.chat_id?.trim() || null;
-}
-
-async function hydrateFeishuTopicThreadIdForQueue(params: {
-  cfg: ClawdbotConfig;
-  accountId: string;
-  event: FeishuMessageEvent;
-  fetchMessage?: FeishuMessageFetcher;
-  log: (...args: unknown[]) => void;
-}): Promise<FeishuMessageEvent> {
-  if (
-    !params.fetchMessage ||
-    !shouldHydrateFeishuTopicThreadIdForQueue({
-      cfg: params.cfg,
-      accountId: params.accountId,
-      event: params.event,
-    })
-  ) {
-    return params.event;
-  }
-  try {
-    const messageInfo = await params.fetchMessage({
-      cfg: params.cfg,
-      accountId: params.accountId,
-      messageId: params.event.message.message_id,
-    });
-    const threadId = messageInfo?.threadId?.trim();
-    if (threadId) {
-      return {
-        ...params.event,
-        message: {
-          ...params.event.message,
-          thread_id: threadId,
-        },
-      };
-    }
-  } catch (err) {
-    params.log(
-      `feishu[${params.accountId}]: failed to hydrate topic thread_id before queueing message=${params.event.message.message_id}: ${String(err)}`,
-    );
-  }
-  return params.event;
 }
 
 function parseFeishuMessageEventPayload(value: unknown): FeishuMessageEvent | null {
@@ -263,9 +174,9 @@ export function createFeishuMessageReceiveHandler({
   recordProcessedMessage,
   getBotOpenId = () => undefined,
   getBotName = () => undefined,
-  fetchMessage,
   resolveSequentialKey = ({ accountId: accountIdLocal, event }) =>
     `feishu:${accountIdLocal}:${event.message.chat_id?.trim() || "unknown"}`,
+  statusSink,
 }: FeishuMessageReceiveHandlerContext): (data: unknown) => Promise<void> {
   const inboundDebounceMs = channelRuntime.debounce.resolveInboundDebounceMs({
     cfg,
@@ -276,27 +187,22 @@ export function createFeishuMessageReceiveHandler({
   const enqueue = createSequentialQueue({
     onTaskTimeout: (key, timeoutMs) => {
       log(
-        `feishu[${accountId}]: per-conversation task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`,
+        `feishu[${accountId}]: per-chat task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`,
       );
     },
   });
-  const pendingTopicQueueingByChat = new Map<string, Promise<void>>();
 
-  const startFeishuMessageQueueTask = (
-    queueEvent: FeishuMessageEvent,
-    messageDedupeKey?: string,
-  ): Promise<void> => {
+  const dispatchFeishuMessage = async (event: FeishuMessageEvent, messageDedupeKey?: string) => {
     const sequentialKey = resolveSequentialKey({
-      cfg,
       accountId,
-      event: queueEvent,
+      event,
       botOpenId: getBotOpenId(accountId),
       botName: getBotName(accountId),
     });
     const task = () =>
       handleMessage({
         cfg,
-        event: queueEvent,
+        event,
         botOpenId: getBotOpenId(accountId),
         botName: getBotName(accountId),
         runtime,
@@ -306,72 +212,7 @@ export function createFeishuMessageReceiveHandler({
         processingClaimHeld: true,
         messageDedupeKey,
       });
-    return enqueue(sequentialKey, task);
-  };
-
-  const hydrateAndStartFeishuMessageQueueTask = async (
-    event: FeishuMessageEvent,
-    messageDedupeKey?: string,
-  ): Promise<void> => {
-    const queueEvent = await hydrateFeishuTopicThreadIdForQueue({
-      cfg,
-      accountId,
-      event,
-      fetchMessage,
-      log,
-    });
-    await startFeishuMessageQueueTask(queueEvent, messageDedupeKey);
-  };
-
-  const waitForPendingTopicQueueing = async (event: FeishuMessageEvent): Promise<void> => {
-    const chatKey = buildPendingTopicChatKey(event);
-    const pendingQueueing = chatKey ? pendingTopicQueueingByChat.get(chatKey) : undefined;
-    if (!pendingQueueing) {
-      return;
-    }
-    await pendingQueueing.catch(() => undefined);
-  };
-
-  const dispatchFeishuMessage = async (event: FeishuMessageEvent, messageDedupeKey?: string) => {
-    const shouldTrackTopicQueueing =
-      event.message.chat_type === "topic_group" && !event.message.thread_id?.trim();
-    if (shouldTrackTopicQueueing) {
-      const chatKey = buildPendingTopicChatKey(event);
-      const previousQueueing =
-        (chatKey ? pendingTopicQueueingByChat.get(chatKey) : undefined) ?? Promise.resolve();
-      let taskPromise: Promise<void> | undefined;
-      const queueingPromise = previousQueueing
-        .catch(() => undefined)
-        .then(async () => {
-          const queueEvent = await hydrateFeishuTopicThreadIdForQueue({
-            cfg,
-            accountId,
-            event,
-            fetchMessage,
-            log,
-          });
-          taskPromise = startFeishuMessageQueueTask(queueEvent, messageDedupeKey);
-        });
-      if (chatKey) {
-        pendingTopicQueueingByChat.set(chatKey, queueingPromise);
-      }
-      try {
-        await queueingPromise;
-      } finally {
-        if (chatKey && pendingTopicQueueingByChat.get(chatKey) === queueingPromise) {
-          pendingTopicQueueingByChat.delete(chatKey);
-        }
-      }
-      try {
-        await taskPromise;
-      } finally {
-        taskPromise = undefined;
-      }
-      return;
-    }
-
-    await waitForPendingTopicQueueing(event);
-    await hydrateAndStartFeishuMessageQueueTask(event, messageDedupeKey);
+    await enqueue(sequentialKey, task);
   };
 
   const resolveSenderDebounceId = (event: FeishuMessageEvent): string | undefined => {
@@ -418,8 +259,7 @@ export function createFeishuMessageReceiveHandler({
         return null;
       }
       const rootId = event.message.root_id?.trim();
-      const threadId = event.message.thread_id?.trim();
-      const threadKey = threadId || rootId ? `thread:${threadId ?? rootId}` : "chat";
+      const threadKey = rootId ? `thread:${rootId}` : "chat";
       return `feishu:${accountId}:${chatId}:${threadKey}:${senderId}`;
     },
     shouldDebounce: (event) => {
@@ -484,11 +324,18 @@ export function createFeishuMessageReceiveHandler({
     },
   });
 
-  return (data) => {
+  return async (data) => {
+    // Publish message recency before dedupe/debounce; transport liveness is
+    // owned by the WebSocket/Webhook lifecycle monitors.
+    const inboundAt = Date.now();
+    statusSink?.({
+      lastEventAt: inboundAt,
+    });
+
     const event = parseFeishuMessageEventPayload(data);
     if (!event) {
       error(`feishu[${accountId}]: ignoring malformed message event payload`);
-      return Promise.resolve();
+      return;
     }
     const messageId = event.message?.message_id?.trim();
     const botOpenId = getBotOpenId(accountId)?.trim();
@@ -497,35 +344,28 @@ export function createFeishuMessageReceiveHandler({
       // Feishu bot receive events identify their sender by open_id. Drop this
       // account's bot before it can consume a claim or debounce slot.
       log(`feishu[${accountId}]: dropping self-authored message ${messageId ?? "unknown"}`);
-      return Promise.resolve();
+      return;
     }
     const messageDedupeKey = resolveFeishuMessageDedupeKey(event);
-    const processingClaimKey = resolveFeishuProcessingClaimKey({ event, messageDedupeKey });
-    if (!tryBeginFeishuMessageProcessing(processingClaimKey, accountId)) {
+    if (!tryBeginFeishuMessageProcessing(messageDedupeKey, accountId)) {
       log(`feishu[${accountId}]: dropping duplicate event for message ${messageId}`);
-      return Promise.resolve();
+      return;
     }
-    log(
-      `feishu[${accountId}]: queued receive event message=${messageId ?? "unknown"} ` +
-        `chat_type=${event.message.chat_type} ` +
-        `thread=${event.message.thread_id?.trim() || "none"} ` +
-        `root=${event.message.root_id?.trim() || "none"}`,
-    );
     const processMessage = async () => {
       await inboundDebouncer.enqueue(event);
     };
     if (fireAndForget) {
-      setImmediate(() => {
-        void processMessage().catch((err: unknown) => {
-          releaseFeishuMessageProcessing(processingClaimKey, accountId);
-          error(`feishu[${accountId}]: error handling message: ${String(err)}`);
-        });
+      void processMessage().catch((err: unknown) => {
+        releaseFeishuMessageProcessing(messageDedupeKey, accountId);
+        error(`feishu[${accountId}]: error handling message: ${String(err)}`);
       });
-      return Promise.resolve();
+      return;
     }
-    return processMessage().catch((err: unknown) => {
-      releaseFeishuMessageProcessing(processingClaimKey, accountId);
+    try {
+      await processMessage();
+    } catch (err) {
+      releaseFeishuMessageProcessing(messageDedupeKey, accountId);
       error(`feishu[${accountId}]: error handling message: ${String(err)}`);
-    });
+    }
   };
 }

@@ -130,7 +130,7 @@ export async function resolveFeishuDmIngressAccess(params: {
   senderUserId?: string | null;
   conversationId: string;
   mayPair: boolean;
-  command?: { hasControlCommand: boolean; commandOwnerAllowFrom?: Array<string | number> };
+  command?: { hasControlCommand: boolean };
 }) {
   return await createFeishuIngressResolver({
     cfg: params.cfg,
@@ -194,7 +194,7 @@ export async function resolveFeishuGroupSenderActivationIngressAccess(params: {
   senderUserId?: string | null;
   requireMention: boolean;
   mentionedBot: boolean;
-  command?: { hasControlCommand: boolean; commandOwnerAllowFrom?: Array<string | number> };
+  command?: { hasControlCommand: boolean };
 }) {
   const groupAllowFrom = params.allowFrom ?? [];
   return await createFeishuIngressResolver({

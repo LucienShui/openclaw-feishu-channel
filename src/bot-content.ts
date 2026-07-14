@@ -39,52 +39,17 @@ type FeishuMessageLike = {
   };
 };
 
-export type FeishuGroupSessionScope =
-  | "group"
-  | "group_sender"
-  | "group_topic"
-  | "group_topic_sender";
-
-export function isFeishuTopicSessionScope(
-  scope: string,
-): scope is "group_topic" | "group_topic_sender" {
-  return scope === "group_topic" || scope === "group_topic_sender";
-}
+type GroupSessionScope = "group" | "group_sender" | "group_topic" | "group_topic_sender";
 
 type FeishuLogger = (...args: unknown[]) => void;
 
 type ResolvedFeishuGroupSession = {
   peerId: string;
   parentPeer: { kind: "group"; id: string } | null;
-  groupSessionScope: FeishuGroupSessionScope;
+  groupSessionScope: GroupSessionScope;
   replyInThread: boolean;
   threadReply: boolean;
 };
-
-export function resolveConfiguredFeishuGroupSessionScope(params: {
-  groupConfig?: {
-    groupSessionScope?: FeishuGroupSessionScope;
-    topicSessionMode?: "enabled" | "disabled";
-  };
-  feishuCfg?: {
-    groupSessionScope?: FeishuGroupSessionScope;
-    topicSessionMode?: "enabled" | "disabled";
-  };
-  chatType?: FeishuChatType;
-  hasThread?: boolean;
-}): FeishuGroupSessionScope {
-  const legacyTopicSessionMode =
-    params.groupConfig?.topicSessionMode ?? params.feishuCfg?.topicSessionMode;
-  return (
-    params.groupConfig?.groupSessionScope ??
-    params.feishuCfg?.groupSessionScope ??
-    (legacyTopicSessionMode === "enabled" ||
-    ((params.chatType === "topic_group" || params.hasThread === true) &&
-      legacyTopicSessionMode !== "disabled")
-      ? "group_topic"
-      : "group")
-  );
-}
 
 export function resolveFeishuGroupSession(params: {
   chatId: string;
@@ -94,12 +59,12 @@ export function resolveFeishuGroupSession(params: {
   threadId?: string;
   chatType?: FeishuChatType;
   groupConfig?: {
-    groupSessionScope?: FeishuGroupSessionScope;
+    groupSessionScope?: GroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
     replyInThread?: "enabled" | "disabled";
   };
   feishuCfg?: {
-    groupSessionScope?: FeishuGroupSessionScope;
+    groupSessionScope?: GroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
     replyInThread?: "enabled" | "disabled";
   };
@@ -112,18 +77,21 @@ export function resolveFeishuGroupSession(params: {
   const replyInThread =
     (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled" ||
     threadReply;
-  const groupSessionScope = resolveConfiguredFeishuGroupSessionScope({
-    groupConfig,
-    feishuCfg,
-    chatType,
-    hasThread: chatType === "topic_group" || Boolean(normalizedThreadId && !normalizedRootId),
-  });
-  const isTopicScope = isFeishuTopicSessionScope(groupSessionScope);
-  const nativeTopicId =
-    chatType === "topic_group" || isTopicScope
-      ? (normalizedThreadId ?? normalizedRootId)
-      : normalizedRootId;
-  const topicScope = isTopicScope ? (nativeTopicId ?? (replyInThread ? messageId : null)) : null;
+  const legacyTopicSessionMode =
+    groupConfig?.topicSessionMode ?? feishuCfg?.topicSessionMode ?? "disabled";
+  const groupSessionScope: GroupSessionScope =
+    groupConfig?.groupSessionScope ??
+    feishuCfg?.groupSessionScope ??
+    (legacyTopicSessionMode === "enabled" ? "group_topic" : "group");
+  const normalizedTopicGroupThreadId =
+    chatType === "topic_group" ? (normalizedThreadId ?? normalizedRootId) : undefined;
+  const topicScope =
+    groupSessionScope === "group_topic" || groupSessionScope === "group_topic_sender"
+      ? (normalizedTopicGroupThreadId ??
+        normalizedRootId ??
+        normalizedThreadId ??
+        (replyInThread ? messageId : null))
+      : null;
 
   let peerId;
   switch (groupSessionScope) {
@@ -152,7 +120,11 @@ export function resolveFeishuGroupSession(params: {
 
   return {
     peerId,
-    parentPeer: topicScope && isTopicScope ? { kind: "group", id: chatId } : null,
+    parentPeer:
+      topicScope &&
+      (groupSessionScope === "group_topic" || groupSessionScope === "group_topic_sender")
+        ? { kind: "group", id: chatId }
+        : null,
     groupSessionScope,
     replyInThread,
     threadReply,
@@ -169,17 +141,8 @@ export function parseMessageContent(content: string, messageType: string): strin
     if (messageType === "text") {
       return parsed.text || "";
     }
-    if (["image", "file", "audio", "video", "media", "sticker"].includes(messageType)) {
-      if (messageType === "audio") {
-        const speechToText =
-          typeof parsed.speech_to_text === "string" ? parsed.speech_to_text.trim() : "";
-        if (speechToText) {
-          return speechToText;
-        }
-      }
-      const placeholder = inferPlaceholder(messageType);
-      const fileName = typeof parsed.file_name === "string" ? parsed.file_name.trim() : "";
-      return fileName ? `${placeholder} (${fileName})` : placeholder;
+    if (FEISHU_MEDIA_MESSAGE_TYPES.has(messageType)) {
+      return formatFeishuMediaContent(parsed, messageType).body;
     }
     if (messageType === "share_chat") {
       if (parsed && typeof parsed === "object") {
@@ -202,6 +165,60 @@ export function parseMessageContent(content: string, messageType: string): strin
     return content;
   } catch {
     return content;
+  }
+}
+
+const FEISHU_MEDIA_MESSAGE_TYPES = new Set(["image", "file", "audio", "video", "media", "sticker"]);
+
+function formatFeishuMediaContent(
+  parsed: Record<string, unknown>,
+  messageType: string,
+): { body: string; mediaPlaceholder?: string; unavailableBody?: string } {
+  const speechToText =
+    messageType === "audio" && typeof parsed.speech_to_text === "string"
+      ? parsed.speech_to_text.trim()
+      : "";
+  if (speechToText) {
+    return { body: speechToText };
+  }
+
+  const placeholder = inferPlaceholder(messageType);
+  const fileName = typeof parsed.file_name === "string" ? parsed.file_name.trim() : "";
+  const body = fileName ? `${placeholder} (${fileName})` : placeholder;
+  return {
+    body,
+    mediaPlaceholder: placeholder,
+    unavailableBody: fileName || undefined,
+  };
+}
+
+export function resolveFeishuMediaFailurePresentation(
+  content: string,
+  messageType: string,
+): { mediaPlaceholder?: string; unavailableBody?: string } {
+  if (messageType === "post") {
+    return {
+      unavailableBody: parsePostContent(content, {
+        renderMediaPlaceholders: false,
+        emptyTextFallback: "",
+      }).textContent,
+    };
+  }
+  if (!FEISHU_MEDIA_MESSAGE_TYPES.has(messageType)) {
+    return {};
+  }
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const presentation = formatFeishuMediaContent(parsed as Record<string, unknown>, messageType);
+    return {
+      mediaPlaceholder: presentation.mediaPlaceholder,
+      unavailableBody: presentation.unavailableBody,
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -408,18 +425,19 @@ export async function resolveFeishuMediaList(params: {
   maxBytes: number;
   log?: (msg: string) => void;
   accountId?: string;
-}): Promise<FeishuMediaInfo[]> {
+}): Promise<{ media: FeishuMediaInfo[]; unavailableCount: number }> {
   const { cfg, messageId, messageType, content, maxBytes, log, accountId } = params;
   const mediaTypes = ["image", "file", "audio", "video", "media", "sticker", "post"];
   if (!mediaTypes.includes(messageType)) {
-    return [];
+    return { media: [], unavailableCount: 0 };
   }
 
   const out: FeishuMediaInfo[] = [];
+  let unavailableCount = 0;
   if (messageType === "post") {
     const { imageKeys, mediaKeys } = parsePostContent(content);
     if (imageKeys.length === 0 && mediaKeys.length === 0) {
-      return [];
+      return { media: [], unavailableCount: 0 };
     }
     if (imageKeys.length > 0) {
       log?.(`feishu: post message contains ${imageKeys.length} embedded image(s)`);
@@ -446,6 +464,7 @@ export async function resolveFeishuMediaList(params: {
         });
         log?.(`feishu: downloaded embedded image ${imageKey}, saved to ${saved.path}`);
       } catch (err) {
+        unavailableCount += 1;
         log?.(`feishu: failed to download embedded image ${imageKey}: ${String(err)}`);
       }
     }
@@ -473,21 +492,22 @@ export async function resolveFeishuMediaList(params: {
         });
         log?.(`feishu: downloaded embedded media ${media.fileKey}, saved to ${saved.path}`);
       } catch (err) {
+        unavailableCount += 1;
         log?.(`feishu: failed to download embedded media ${media.fileKey}: ${String(err)}`);
       }
     }
-    return out;
+    return { media: out, unavailableCount };
   }
 
   const mediaKeys = parseMediaKeys(content, messageType);
   if (!mediaKeys.imageKey && !mediaKeys.fileKey) {
-    return [];
+    return { media: [], unavailableCount: 1 };
   }
 
   try {
     const fileKey = mediaKeys.fileKey || mediaKeys.imageKey;
     if (!fileKey) {
-      return [];
+      return { media: [], unavailableCount: 1 };
     }
     const result = await saveMessageResourceFeishu({
       cfg,
@@ -510,7 +530,8 @@ export async function resolveFeishuMediaList(params: {
     });
     log?.(`feishu: downloaded ${messageType} media, saved to ${saved.path}`);
   } catch (err) {
+    unavailableCount += 1;
     log?.(`feishu: failed to download ${messageType} media: ${String(err)}`);
   }
-  return out;
+  return { media: out, unavailableCount };
 }
