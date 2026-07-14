@@ -1,7 +1,12 @@
 // Feishu plugin module implements bot content behavior.
 import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
 import type { ClawdbotConfig } from "../runtime-api.js";
-import { buildFeishuConversationId } from "./conversation-id.js";
+import {
+  buildFeishuConversationId,
+  isFeishuTopicSessionScope,
+  resolveConfiguredFeishuGroupSessionScope,
+  type FeishuGroupSessionScope,
+} from "./conversation-id.js";
 import { normalizeFeishuExternalKey } from "./external-keys.js";
 import { saveMessageResourceFeishu } from "./media.js";
 import { isFeishuBroadcastMention } from "./mention.js";
@@ -39,14 +44,12 @@ type FeishuMessageLike = {
   };
 };
 
-type GroupSessionScope = "group" | "group_sender" | "group_topic" | "group_topic_sender";
-
 type FeishuLogger = (...args: unknown[]) => void;
 
 type ResolvedFeishuGroupSession = {
   peerId: string;
   parentPeer: { kind: "group"; id: string } | null;
-  groupSessionScope: GroupSessionScope;
+  groupSessionScope: FeishuGroupSessionScope;
   replyInThread: boolean;
   threadReply: boolean;
 };
@@ -59,12 +62,12 @@ export function resolveFeishuGroupSession(params: {
   threadId?: string;
   chatType?: FeishuChatType;
   groupConfig?: {
-    groupSessionScope?: GroupSessionScope;
+    groupSessionScope?: FeishuGroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
     replyInThread?: "enabled" | "disabled";
   };
   feishuCfg?: {
-    groupSessionScope?: GroupSessionScope;
+    groupSessionScope?: FeishuGroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
     replyInThread?: "enabled" | "disabled";
   };
@@ -77,21 +80,20 @@ export function resolveFeishuGroupSession(params: {
   const replyInThread =
     (groupConfig?.replyInThread ?? feishuCfg?.replyInThread ?? "disabled") === "enabled" ||
     threadReply;
-  const legacyTopicSessionMode =
-    groupConfig?.topicSessionMode ?? feishuCfg?.topicSessionMode ?? "disabled";
-  const groupSessionScope: GroupSessionScope =
-    groupConfig?.groupSessionScope ??
-    feishuCfg?.groupSessionScope ??
-    (legacyTopicSessionMode === "enabled" ? "group_topic" : "group");
-  const normalizedTopicGroupThreadId =
-    chatType === "topic_group" ? (normalizedThreadId ?? normalizedRootId) : undefined;
-  const topicScope =
-    groupSessionScope === "group_topic" || groupSessionScope === "group_topic_sender"
-      ? (normalizedTopicGroupThreadId ??
-        normalizedRootId ??
-        normalizedThreadId ??
-        (replyInThread ? messageId : null))
-      : null;
+  const groupSessionScope = resolveConfiguredFeishuGroupSessionScope({
+    groupConfig,
+    feishuCfg,
+    chatType,
+    hasThread: chatType === "topic_group" || Boolean(normalizedThreadId && !normalizedRootId),
+  });
+  const isTopicScope = isFeishuTopicSessionScope(groupSessionScope);
+  // When topic-scoped, prefer thread_id then root_id so native topic groups and
+  // configured topic isolation share a stable conversation key.
+  const nativeTopicId =
+    chatType === "topic_group" || isTopicScope
+      ? (normalizedThreadId ?? normalizedRootId)
+      : normalizedRootId;
+  const topicScope = isTopicScope ? (nativeTopicId ?? (replyInThread ? messageId : null)) : null;
 
   let peerId;
   switch (groupSessionScope) {
@@ -120,11 +122,7 @@ export function resolveFeishuGroupSession(params: {
 
   return {
     peerId,
-    parentPeer:
-      topicScope &&
-      (groupSessionScope === "group_topic" || groupSessionScope === "group_topic_sender")
-        ? { kind: "group", id: chatId }
-        : null,
+    parentPeer: topicScope && isTopicScope ? { kind: "group", id: chatId } : null,
     groupSessionScope,
     replyInThread,
     threadReply,

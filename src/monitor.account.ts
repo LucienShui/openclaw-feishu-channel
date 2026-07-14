@@ -310,6 +310,7 @@ function registerEventHandlers(
       recordProcessedMessage: recordProcessedFeishuMessage,
       getBotOpenId: (id) => botOpenIds.get(id),
       getBotName: (id) => botNames.get(id),
+      fetchMessage: getMessageFeishu,
       resolveSequentialKey: getFeishuSequentialKey,
       ...(context.statusSink ? { statusSink: context.statusSink } : {}),
     }),

@@ -7,6 +7,19 @@ export type FeishuGroupSessionScope =
   | "group_topic"
   | "group_topic_sender";
 
+export function isFeishuTopicSessionScope(
+  scope: string,
+): scope is "group_topic" | "group_topic_sender" {
+  return scope === "group_topic" || scope === "group_topic_sender";
+}
+
+/**
+ * Resolve group session scope for inbound Feishu chats.
+ *
+ * Fork behavior (vs monorepo default-opt-in): native topic groups and inbound
+ * thread context default to `group_topic` unless `topicSessionMode` is
+ * explicitly `disabled` or `groupSessionScope` is set.
+ */
 export function resolveConfiguredFeishuGroupSessionScope(params: {
   groupConfig?: {
     groupSessionScope?: FeishuGroupSessionScope;
@@ -16,13 +29,19 @@ export function resolveConfiguredFeishuGroupSessionScope(params: {
     groupSessionScope?: FeishuGroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
   };
+  chatType?: string;
+  hasThread?: boolean;
 }): FeishuGroupSessionScope {
   const legacyTopicSessionMode =
-    params.groupConfig?.topicSessionMode ?? params.feishuCfg?.topicSessionMode ?? "disabled";
+    params.groupConfig?.topicSessionMode ?? params.feishuCfg?.topicSessionMode;
   return (
     params.groupConfig?.groupSessionScope ??
     params.feishuCfg?.groupSessionScope ??
-    (legacyTopicSessionMode === "enabled" ? "group_topic" : "group")
+    (legacyTopicSessionMode === "enabled" ||
+    ((params.chatType === "topic_group" || params.hasThread === true) &&
+      legacyTopicSessionMode !== "disabled")
+      ? "group_topic"
+      : "group")
   );
 }
 
