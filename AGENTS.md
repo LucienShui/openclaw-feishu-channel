@@ -28,11 +28,22 @@ Do not copy monorepo-only concerns (workspace devDependencies, monorepo test har
 
 This checkout is not a pure mirror of upstream Feishu. After every monorepo sync, preserve the following unless an intentional product change says otherwise.
 
+### Recorded divergence baseline
+
+The last audited baseline is OpenClaw `v2026.7.1` (tag target `2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4`). Commit `3c9caf9` imported that upstream version; it is a sync baseline, not a fork feature. Commit `fc4c04d` is the authoritative re-application of both fork behaviors below onto that baseline.
+
+Feature ancestry:
+
+- Topic/thread session isolation was present in the initial import `0c02bd1` and was restored after the `v2026.7.1` sync by `fc4c04d`.
+- In-flight `/stop` cancellation was introduced by `98626bd`; `fc4c04d` restored its integration after the sync.
+
+At that baseline, production-code differences were limited to `src/bot-content.ts`, `src/bot.ts`, `src/config-schema.ts`, `src/conversation-id.ts`, `src/feishu-reply-fence.ts`, `src/monitor.account.ts`, `src/monitor.message-handler.ts`, `src/policy.ts`, and `src/sequential-key.ts`. Root entry points, `openclaw.plugin.json`, and `skills/` matched upstream. Re-audit this list on every new upstream tag; it is a historical checkpoint, not permission to overwrite new upstream changes wholesale.
+
 ### Topic / thread → session isolation
 
 Different Feishu topics (threads) map to different agent sessions. Important pieces:
 
-- Default scope: native `topic_group` chats (and inbound thread context when `topicSessionMode` is not `disabled`) resolve to `group_topic` unless `groupSessionScope` is set explicitly. Upstream monorepo has tightened this toward an explicit opt-in default of `group`.
+- Default scope: native `topic_group` chats (and inbound thread context when `topicSessionMode` is not `disabled`) resolve to `group_topic` unless `groupSessionScope` is set explicitly. Upstream `v2026.7.1` already supports explicit `group_topic`, but defaults to `group` unless topic isolation is opted into.
 - Session keys use conversation ids such as `chat:topic:…` / `…:sender:…` (`conversation-id.ts`, `bot-content.ts`).
 - Missing starter `thread_id` on topic events is hydrated before sequential queueing so first turns and follow-ups stay on the same topic session (`monitor.message-handler.ts`).
 - Sequential control lanes and outbound reply anchors should stay aligned with the topic session peer (`sequential-key.ts`, reply / channel send paths).
