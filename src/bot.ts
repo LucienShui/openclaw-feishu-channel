@@ -57,7 +57,10 @@ import { resolveGroupName } from "./bot-group-name.js";
 import { resolveFeishuBotName } from "./bot-name.js";
 import { resolveFeishuSenderName, type FeishuPermissionError } from "./bot-sender-name.js";
 import { createFeishuClient } from "./client.js";
-import { resolveConfiguredFeishuGroupSessionScope } from "./conversation-id.js";
+import {
+  isFeishuTopicSessionScope,
+  resolveConfiguredFeishuGroupSessionScope,
+} from "./conversation-id.js";
 import {
   claimUnprocessedFeishuMessage,
   finalizeFeishuMessageProcessing,
@@ -67,6 +70,7 @@ import { resolveFeishuMessageDedupeKey } from "./dedupe-key.js";
 import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
 import type { FeishuMessageEvent } from "./event-types.js";
 import type { FeishuIngressLifecycle } from "./feishu-ingress.js";
+import { createFeishuReplyFenceGuard } from "./feishu-reply-fence.js";
 import {
   extractMentionTargets,
   isFeishuBroadcastMention,
@@ -512,7 +516,12 @@ export async function handleFeishuMessage(params: {
     ? resolveFeishuGroupConfig({ cfg: feishuCfg, groupId: ctx.chatId })
     : undefined;
   const groupSessionScope = isGroup
-    ? resolveConfiguredFeishuGroupSessionScope({ groupConfig, feishuCfg })
+    ? resolveConfiguredFeishuGroupSessionScope({
+        groupConfig,
+        feishuCfg,
+        chatType: ctx.chatType,
+        hasThread: Boolean(ctx.threadId?.trim() && !ctx.rootId?.trim()),
+      })
     : null;
   let effectiveThreadId = ctx.threadId;
   if (
@@ -1604,7 +1613,11 @@ export async function handleFeishuMessage(params: {
 
       type BroadcastInboundVariant =
         | { kind: "observeOnly" }
-        | { kind: "active"; dispatcher: ReturnType<typeof createFeishuReplyDispatcher> };
+        | {
+            kind: "active";
+            dispatcher: ReturnType<typeof createFeishuReplyDispatcher>;
+            replyFence: ReturnType<typeof createFeishuReplyFenceGuard>;
+          };
       const createBroadcastInboundAdapter = (paramsLocal: {
         agentId: string;
         sessionKey: string;
@@ -1642,6 +1655,7 @@ export async function handleFeishuMessage(params: {
                 delivery: paramsLocal.variant.dispatcher.delivery,
                 replyOptions: {
                   ...paramsLocal.variant.dispatcher.replyOptions,
+                  abortSignal: paramsLocal.variant.replyFence.abortSignal,
                   ...bindIngressLifecycleToReplyOptions(paramsLocal.lifecycle),
                 },
               }),
@@ -1683,6 +1697,7 @@ export async function handleFeishuMessage(params: {
         const lane = broadcastSettlement.createLane(
           agentClaim?.kind === "claimed" ? agentClaim.handle : undefined,
         );
+        let replyFenceForDispatch: ReturnType<typeof createFeishuReplyFenceGuard> | undefined;
 
         try {
           const agentSessionKey = buildBroadcastSessionKey(
@@ -1716,6 +1731,10 @@ export async function handleFeishuMessage(params: {
             route.accountId,
             ctx.mentionedBot && agentId === activeAgentId,
           );
+          const replyFence = createFeishuReplyFenceGuard(agentCtx, (msg) =>
+            log(`feishu[${account.accountId}]: ${msg}`),
+          );
+          replyFenceForDispatch = replyFence;
 
           let variant: BroadcastInboundVariant;
           if (agentId === activeAgentId) {
@@ -1723,6 +1742,7 @@ export async function handleFeishuMessage(params: {
             const identity = resolveAgentOutboundIdentity(cfg, agentId);
             variant = {
               kind: "active",
+              replyFence,
               dispatcher: createFeishuReplyDispatcher({
                 cfg,
                 agentId,
@@ -1774,6 +1794,7 @@ export async function handleFeishuMessage(params: {
           });
           if (
             variant.kind === "active" &&
+            !variant.replyFence.isSuperseded() &&
             turnResult.dispatched &&
             shouldSendNoVisibleReplyFallback(turnResult.dispatchResult)
           ) {
@@ -1781,8 +1802,14 @@ export async function handleFeishuMessage(params: {
               "broadcast-dispatch-complete-no-visible-reply",
             );
           }
+          if (variant.kind === "active") {
+            variant.replyFence.end();
+          } else {
+            replyFence.end();
+          }
           await lane.onDispatchComplete(turnResult.dispatched);
         } catch (err) {
+          replyFenceForDispatch?.end();
           await lane.onDispatchFailed(err);
           throw err;
         }
@@ -1873,8 +1900,12 @@ export async function handleFeishuMessage(params: {
           messageCreateTimeMs,
           sessionKey: route.sessionKey,
         });
+      const replyFence = createFeishuReplyFenceGuard(ctxPayload, (msg) =>
+        log(`feishu[${account.accountId}]: ${msg}`),
+      );
 
       log(`feishu[${account.accountId}]: dispatching to agent (session=${route.sessionKey})`);
+      try {
       const turnResult = await core.channel.inbound.run({
         channel: "feishu",
         accountId: route.accountId,
@@ -1915,6 +1946,7 @@ export async function handleFeishuMessage(params: {
             delivery,
             replyOptions: {
               ...replyOptions,
+              abortSignal: replyFence.abortSignal,
               ...(turnAdoptionLifecycle
                 ? bindIngressLifecycleToReplyOptions(turnAdoptionLifecycle)
                 : {}),
@@ -1927,13 +1959,16 @@ export async function handleFeishuMessage(params: {
       }
       const { dispatchResult } = turnResult;
       const { queuedFinal, counts } = dispatchResult;
-      if (shouldSendNoVisibleReplyFallback(dispatchResult)) {
+      if (!replyFence.isSuperseded() && shouldSendNoVisibleReplyFallback(dispatchResult)) {
         await ensureNoVisibleReplyFallback("dispatch-complete-no-visible-reply");
       }
 
       log(
         `feishu[${account.accountId}]: dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final})`,
       );
+      } finally {
+        replyFence.end();
+      }
     }
   } catch (err) {
     error(`feishu[${account.accountId}]: failed to dispatch message: ${String(err)}`);

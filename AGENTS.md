@@ -22,6 +22,16 @@ Recommended order when rebasing onto a new OpenClaw tag (for example `v2026.7.1`
 4. Re-apply **fork-specific behavior** below on top of the new baseline (port by intent into the updated file layout; do not wholesale restore old `bot.ts` over upstream fixes).
 5. Verify with `npx tsc --noEmit`, `npm run build`, and `openclaw plugins install --link "$PWD"`.
 
+### Mandatory fork-feature recheck after every sync
+
+Every upstream sync must explicitly re-audit and preserve all fork-specific behavior before it is considered complete:
+
+- Default topic/thread session isolation: topic-group chats and inbound thread context must resolve to `group_topic` by default, while honoring explicit `groupSessionScope` and `topicSessionMode: "disabled"` overrides.
+- In-flight `/stop` cancellation: keep `src/feishu-reply-fence.ts`, pass its `AbortSignal` through every reply/dispatch path (including broadcast active-agent replies), and suppress stale no-visible-reply fallbacks after cancellation.
+- Topic-aligned control lanes: `/stop`, `/btw`, sequential queue keys, and outbound reply anchors must use the resolved topic/session peer rather than only the chat id.
+
+Do not treat upstream support for an explicit `group_topic` setting as sufficient: this fork also requires topic isolation by default and the reply-fence cancellation path. Before declaring a sync done, inspect the affected paths with `rg`, review the diff for accidental overwrites, and run the verification commands above.
+
 Do not copy monorepo-only concerns (workspace devDependencies, monorepo test harness requirements) unless this repo intentionally adds the same tooling.
 
 ## Fork-Specific Behavior (vs monorepo `extensions/feishu`)
