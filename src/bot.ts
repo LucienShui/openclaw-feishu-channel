@@ -124,12 +124,6 @@ function shouldSendNoVisibleReplyFallback(dispatchResult: {
   );
 }
 
-function isFeishuTopicSessionScope(
-  scope: ReturnType<typeof resolveConfiguredFeishuGroupSessionScope>,
-): boolean {
-  return scope === "group_topic" || scope === "group_topic_sender";
-}
-
 async function resolveFeishuAudioTranscript(params: {
   cfg: ClawdbotConfig;
   mediaList: FeishuMediaInfo[];
