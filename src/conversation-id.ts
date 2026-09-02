@@ -1,5 +1,8 @@
 // Feishu plugin module implements conversation id behavior.
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString as normalizeText,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export type FeishuGroupSessionScope =
   | "group"
@@ -7,19 +10,6 @@ export type FeishuGroupSessionScope =
   | "group_topic"
   | "group_topic_sender";
 
-export function isFeishuTopicSessionScope(
-  scope: string,
-): scope is "group_topic" | "group_topic_sender" {
-  return scope === "group_topic" || scope === "group_topic_sender";
-}
-
-/**
- * Resolve group session scope for inbound Feishu chats.
- *
- * Fork behavior (vs monorepo default-opt-in): native topic groups and inbound
- * thread context default to `group_topic` unless `topicSessionMode` is
- * explicitly `disabled` or `groupSessionScope` is set.
- */
 export function resolveConfiguredFeishuGroupSessionScope(params: {
   groupConfig?: {
     groupSessionScope?: FeishuGroupSessionScope;
@@ -29,28 +19,14 @@ export function resolveConfiguredFeishuGroupSessionScope(params: {
     groupSessionScope?: FeishuGroupSessionScope;
     topicSessionMode?: "enabled" | "disabled";
   };
-  chatType?: string;
-  hasThread?: boolean;
 }): FeishuGroupSessionScope {
   const legacyTopicSessionMode =
-    params.groupConfig?.topicSessionMode ?? params.feishuCfg?.topicSessionMode;
+    params.groupConfig?.topicSessionMode ?? params.feishuCfg?.topicSessionMode ?? "disabled";
   return (
     params.groupConfig?.groupSessionScope ??
     params.feishuCfg?.groupSessionScope ??
-    (legacyTopicSessionMode === "enabled" ||
-    ((params.chatType === "topic_group" || params.hasThread === true) &&
-      legacyTopicSessionMode !== "disabled")
-      ? "group_topic"
-      : "group")
+    (legacyTopicSessionMode === "enabled" ? "group_topic" : "group")
   );
-}
-
-function normalizeText(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed || undefined;
 }
 
 export function buildFeishuConversationId(params: {
@@ -143,6 +119,9 @@ export function parseFeishuConversationId(params: {
   const topicSenderMatch = conversationId.match(/^(.+):topic:([^:]+):sender:([^:]+)$/i);
   if (topicSenderMatch) {
     const [, chatId, topicId, senderOpenId] = topicSenderMatch;
+    if (chatId === undefined || topicId === undefined || senderOpenId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,
@@ -160,6 +139,9 @@ export function parseFeishuConversationId(params: {
   const topicMatch = conversationId.match(/^(.+):topic:([^:]+)$/i);
   if (topicMatch) {
     const [, chatId, topicId] = topicMatch;
+    if (chatId === undefined || topicId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,
@@ -175,6 +157,9 @@ export function parseFeishuConversationId(params: {
   const senderMatch = conversationId.match(/^(.+):sender:([^:]+)$/i);
   if (senderMatch) {
     const [, chatId, senderOpenId] = senderMatch;
+    if (chatId === undefined || senderOpenId === undefined) {
+      return null;
+    }
     return {
       canonicalConversationId: buildFeishuConversationId({
         chatId,

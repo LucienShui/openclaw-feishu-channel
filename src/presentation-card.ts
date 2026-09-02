@@ -1,54 +1,154 @@
 // Feishu plugin module implements presentation card behavior.
 import {
+  legacyInteractiveReplyToPresentation,
+  normalizeLegacyInteractiveReply,
   normalizeMessagePresentation,
+  renderMessagePresentationChartFallbackText,
   renderMessagePresentationFallbackText,
+  renderMessagePresentationTableFallbackText,
   type MessagePresentationBlock,
   type MessagePresentationButton,
 } from "openclaw/plugin-sdk/interactive-runtime";
 import { createFeishuCardInteractionEnvelope } from "./card-interaction.js";
+import {
+  escapeFeishuCardMarkdownText,
+  escapeFeishuCardPlainText,
+  resolveSafeFeishuButtonUrl,
+} from "./native-card.js";
 
 type NormalizedMessagePresentation = NonNullable<ReturnType<typeof normalizeMessagePresentation>>;
+type FeishuPresentationTextFormat = "plain" | "markdown";
 
-function escapeFeishuCardMarkdownText(text: string): string {
-  return text.replace(/[&<>]/g, (char) => {
-    switch (char) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      default:
-        return char;
-    }
-  });
+const FEISHU_CARD_MAX_BYTES = 30 * 1024;
+const FEISHU_CARD_MAX_ELEMENTS = 200;
+
+export function resolveFeishuRichReply(payload: { interactive?: unknown; presentation?: unknown }) {
+  const interactive = normalizeLegacyInteractiveReply(payload.interactive);
+  return {
+    interactive,
+    presentation:
+      normalizeMessagePresentation(payload.presentation) ??
+      (interactive ? legacyInteractiveReplyToPresentation(interactive) : undefined),
+  };
 }
 
-function resolveSafeFeishuButtonUrl(url: string | undefined): string | undefined {
-  const trimmed = url?.trim();
-  if (!trimmed) {
-    return undefined;
+export function buildFeishuPresentationFallback(params: {
+  text?: string;
+  presentation?: NormalizedMessagePresentation;
+  fallbackHasCommand?: boolean;
+  textFormat?: FeishuPresentationTextFormat;
+}) {
+  const fallbackText = renderFeishuPresentationFallbackText(params, params.textFormat);
+  // Only warn when the rendered fallback exposes a command the user can copy.
+  const fallbackHasCommand =
+    params.fallbackHasCommand === true ||
+    params.presentation?.blocks.some((block) =>
+      block.type === "select"
+        ? block.options.some(({ action }) => action?.type === "command")
+        : block.type === "buttons" &&
+          block.buttons.some(({ action, disabled }) => !disabled && action?.type === "command"),
+    ) === true;
+  return {
+    fallbackText,
+    fallbackHasCommand,
+    commentText: fallbackHasCommand
+      ? `${fallbackText}\n\n> Interactive buttons are unavailable in Feishu document comments. You can type the command shown above manually.`
+      : fallbackText,
+  };
+}
+
+function countFeishuCardElements(value: unknown, ancestors = new Set<object>()): number {
+  if (Array.isArray(value)) {
+    return value.reduce((count, entry) => count + countFeishuCardElements(entry, ancestors), 0);
   }
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  if (ancestors.has(value)) {
+    return FEISHU_CARD_MAX_ELEMENTS + 1;
+  }
+  ancestors.add(value);
+  const record = value as Record<string, unknown>;
+  let count = typeof record.tag === "string" ? 1 : 0;
+  for (const entry of Object.values(record)) {
+    count += countFeishuCardElements(entry, ancestors);
+    if (count > FEISHU_CARD_MAX_ELEMENTS) {
+      break;
+    }
+  }
+  ancestors.delete(value);
+  return count;
+}
+
+export function isFeishuCardWithinEnvelope(card: Record<string, unknown>): boolean {
   try {
-    const parsed = new URL(trimmed);
-    return parsed.protocol === "https:" || parsed.protocol === "http:" ? trimmed : undefined;
+    return (
+      Buffer.byteLength(JSON.stringify(card), "utf8") <= FEISHU_CARD_MAX_BYTES &&
+      countFeishuCardElements(card) <= FEISHU_CARD_MAX_ELEMENTS
+    );
   } catch {
-    return undefined;
+    return false;
+  }
+}
+
+export function assertFeishuCardWithinEnvelope(
+  card: Record<string, unknown>,
+  label = "Feishu card",
+): void {
+  if (!isFeishuCardWithinEnvelope(card)) {
+    throw new Error(`${label} exceeds the 30 KB or 200-element API limit.`);
   }
 }
 
 function resolveFeishuButtonUrl(button: MessagePresentationButton): string | undefined {
+  if (button.action?.type === "url" || button.action?.type === "web-app") {
+    return button.action.url;
+  }
+  if (button.action) {
+    return undefined;
+  }
   return button.url ?? button.webApp?.url ?? button.web_app?.url;
 }
 
 function resolveFeishuCommandButtonValue(button: MessagePresentationButton): string | undefined {
-  if (button.action?.type === "callback") {
-    return undefined;
-  }
   if (button.action?.type === "command") {
     return button.action.command;
   }
+  if (button.action) {
+    return undefined;
+  }
   return button.value;
+}
+
+export function renderFeishuPresentationFallbackText(
+  params: Parameters<typeof renderMessagePresentationFallbackText>[0],
+  textFormat: FeishuPresentationTextFormat = "plain",
+): string {
+  const presentation = params.presentation;
+  return renderMessagePresentationFallbackText({
+    ...params,
+    presentation: presentation && {
+      ...presentation,
+      blocks: presentation.blocks.map((block) =>
+        block.type === "buttons"
+          ? {
+              type: block.type,
+              buttons: block.buttons.map((button) => {
+                const url = resolveFeishuButtonUrl(button);
+                // Reject the same targets everywhere; only Markdown transports escape labels.
+                return {
+                  ...button,
+                  ...(textFormat === "markdown"
+                    ? { label: escapeFeishuCardPlainText(button.label) }
+                    : {}),
+                  ...(url && !resolveSafeFeishuButtonUrl(url) ? { disabled: true } : {}),
+                };
+              }),
+            }
+          : block,
+      ),
+    },
+  });
 }
 
 function mapFeishuButtonType(style: MessagePresentationButton["style"]) {
@@ -61,26 +161,17 @@ function mapFeishuButtonType(style: MessagePresentationButton["style"]) {
   return "default";
 }
 
-function buildFeishuPayloadButton(
-  button: MessagePresentationButton,
-): Record<string, unknown> | undefined {
-  const behaviors: Record<string, unknown>[] = [];
-  const rendered: Record<string, unknown> = {
-    tag: "button",
-    text: {
-      tag: "plain_text",
-      content: button.label,
-    },
-    type: mapFeishuButtonType(button.style),
-  };
-  const url = resolveFeishuButtonUrl(button);
-  if (url) {
-    const safeUrl = resolveSafeFeishuButtonUrl(url);
-    if (safeUrl) {
-      behaviors.push({ type: "open_url", default_url: safeUrl });
-    }
-  }
+function buildFeishuPayloadButton(button: MessagePresentationButton): Record<string, unknown> {
+  const url = resolveSafeFeishuButtonUrl(resolveFeishuButtonUrl(button));
   const value = resolveFeishuCommandButtonValue(button);
+  if (button.disabled || (!url && !value)) {
+    // Keep each unavailable control visible without exposing rejected URLs or opaque values.
+    return { tag: "markdown", content: `- ${escapeFeishuCardPlainText(button.label)}` };
+  }
+  const behaviors: Record<string, unknown>[] = [];
+  if (url) {
+    behaviors.push({ type: "open_url", default_url: url });
+  }
   if (value) {
     behaviors.push({
       type: "callback",
@@ -91,11 +182,12 @@ function buildFeishuPayloadButton(
       }),
     });
   }
-  if (behaviors.length === 0) {
-    return undefined;
-  }
-  rendered.behaviors = behaviors;
-  return rendered;
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: button.label },
+    type: mapFeishuButtonType(button.style),
+    behaviors,
+  };
 }
 
 function buildFeishuCardElementsForBlock(
@@ -116,17 +208,30 @@ function buildFeishuCardElementsForBlock(
     return [{ tag: "hr" }];
   }
   if (block.type === "buttons") {
-    return block.buttons
-      .map((button) => buildFeishuPayloadButton(button))
-      .filter((button): button is Record<string, unknown> => Boolean(button));
+    return block.buttons.map(buildFeishuPayloadButton);
   }
-  const labels = block.options.map((option) => `- ${option.label}`).join("\n");
+  if (block.type === "chart") {
+    return [
+      {
+        tag: "markdown",
+        content: escapeFeishuCardMarkdownText(renderMessagePresentationChartFallbackText(block)),
+      },
+    ];
+  }
+  if (block.type === "table") {
+    return [
+      {
+        tag: "markdown",
+        content: escapeFeishuCardMarkdownText(renderMessagePresentationTableFallbackText(block)),
+      },
+    ];
+  }
   return [
     {
       tag: "markdown",
-      content: `${escapeFeishuCardMarkdownText(
-        block.placeholder?.trim() || "Options",
-      )}:\n${escapeFeishuCardMarkdownText(labels)}`,
+      content: escapeFeishuCardMarkdownText(
+        renderMessagePresentationFallbackText({ presentation: { blocks: [block] } }),
+      ),
     },
   ];
 }
@@ -164,20 +269,7 @@ export function buildFeishuPresentationCardElements(params: {
   if (elements.length > 0) {
     return elements;
   }
-  return [
-    {
-      tag: "markdown",
-      content: renderMessagePresentationFallbackText({
-        text: params.fallbackText,
-        presentation: params.presentation.title
-          ? {
-              ...(params.presentation.tone ? { tone: params.presentation.tone } : {}),
-              blocks: params.presentation.blocks,
-            }
-          : params.presentation,
-      }),
-    },
-  ];
+  return [{ tag: "markdown", content: "" }];
 }
 
 export function buildFeishuPresentationCard(params: {

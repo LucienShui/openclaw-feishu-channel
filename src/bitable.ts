@@ -3,13 +3,10 @@ import type * as Lark from "@larksuiteoapi/node-sdk";
 import { optionalPositiveIntegerSchema } from "openclaw/plugin-sdk/channel-actions";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { readPositiveIntegerParam } from "openclaw/plugin-sdk/param-readers";
-import { jsonResult as json } from "openclaw/plugin-sdk/tool-results";
 import { Type, type TSchema } from "typebox";
 import type { OpenClawPluginApi } from "../runtime-api.js";
-import { listEnabledFeishuAccounts } from "./accounts.js";
-import { createFeishuClient } from "./client.js";
-import { resolveAnyEnabledFeishuToolsConfig, resolveFeishuToolAccount } from "./tool-account.js";
-import { resolveToolsConfig } from "./tools-config.js";
+import { createFeishuToolClient, resolveAnyEnabledFeishuToolsConfig } from "./tool-account.js";
+import { feishuExternalToolResult as json } from "./tool-result.js";
 
 type LarkResponse<T = unknown> = { code?: number; msg?: string; data?: T };
 type BitableRecordCreatePayload = NonNullable<
@@ -82,13 +79,19 @@ function parseBitableUrl(url: string): { token: string; tableId?: string; isWiki
     // Wiki format: /wiki/XXXXX?table=YYY
     const wikiMatch = u.pathname.match(/\/wiki\/([A-Za-z0-9]+)/);
     if (wikiMatch) {
-      return { token: wikiMatch[1], tableId, isWiki: true };
+      const wikiPathSegment = wikiMatch[1];
+      return wikiPathSegment === undefined
+        ? null
+        : { token: wikiPathSegment, tableId, isWiki: true };
     }
 
     // Base format: /base/XXXXX?table=YYY
     const baseMatch = u.pathname.match(/\/base\/([A-Za-z0-9]+)/);
     if (baseMatch) {
-      return { token: baseMatch[1], tableId, isWiki: false };
+      const basePathSegment = baseMatch[1];
+      return basePathSegment === undefined
+        ? null
+        : { token: basePathSegment, tableId, isWiki: false };
     }
 
     return null;
@@ -407,7 +410,7 @@ async function createApp(
       path: { app_token: appToken },
     });
     if (tablesRes.code === 0 && tablesRes.data?.items && tablesRes.data.items.length > 0) {
-      tableId = tablesRes.data.items[0].table_id ?? undefined;
+      tableId = tablesRes.data.items.at(0)?.table_id;
       if (tableId) {
         const cleanup = await cleanupNewBitable(client, appToken, tableId, name, log);
         cleanedRows = cleanup.cleanedRows;
@@ -582,25 +585,20 @@ export function registerFeishuBitableTools(api: OpenClawPluginApi) {
     return;
   }
 
-  const accounts = listEnabledFeishuAccounts(api.config);
-  if (accounts.length === 0) {
-    return;
-  }
-
-  const toolsCfg = resolveAnyEnabledFeishuToolsConfig(accounts);
+  const toolsCfg = resolveAnyEnabledFeishuToolsConfig(api.config);
   if (!toolsCfg.bitable) {
     return;
   }
 
   type AccountAwareParams = { accountId?: string };
 
-  const getClient = (params: AccountAwareParams | undefined, defaultAccountId?: string) => {
-    const account = resolveFeishuToolAccount({ api, executeParams: params, defaultAccountId });
-    if (!resolveToolsConfig(account.config.tools).bitable) {
-      throw new Error(`Feishu Bitable tools are disabled for account "${account.accountId}"`);
-    }
-    return createFeishuClient(account);
-  };
+  const getClient = (params: AccountAwareParams | undefined, defaultAccountId?: string) =>
+    createFeishuToolClient({
+      api,
+      executeParams: params,
+      defaultAccountId,
+      requiredTool: { family: "bitable", label: "Bitable" },
+    });
 
   const registerBitableTool = <
     // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Tool params bind each schema-specific executor to its registered tool.
@@ -615,6 +613,7 @@ export function registerFeishuBitableTools(api: OpenClawPluginApi) {
     api.registerTool(
       (ctx) => ({
         name: params.name,
+        resultContentSource: "network",
         label: params.label,
         description: params.description,
         parameters: params.parameters,
