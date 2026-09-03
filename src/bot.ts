@@ -891,6 +891,10 @@ export async function handleFeishuMessage(params: {
     const commandAllowFrom = isGroup
       ? (groupConfig?.allowFrom ?? effectiveConfigAllowFrom)
       : (effectiveDmIngress?.senderAccess.effectiveAllowFrom ?? effectiveConfigAllowFrom);
+    const groupMentionCommandOwnerAllowFrom =
+      isGroup && ctx.mentionedBot
+        ? [ctx.senderOpenId, ...(senderUserId ? [senderUserId] : [])]
+        : undefined;
 
     const currentConversationId = peerId;
     const parentConversationId = isGroup ? (parentPeer?.id ?? ctx.chatId) : undefined;
@@ -1078,7 +1082,6 @@ export async function handleFeishuMessage(params: {
           ]
         : undefined;
     const agentFacingContent = audioTranscript ?? mediaFailureContent;
-    const commandFacingContent = audioTranscript ?? ctx.content;
     const agentFacingCtx =
       agentFacingContent === ctx.content
         ? ctx
@@ -1099,6 +1102,9 @@ export async function handleFeishuMessage(params: {
             effectiveCommandProbeBody,
             effectiveCfg,
           );
+    const commandFacingContent = shouldComputeEffectiveCommandAuthorized
+      ? effectiveCommandProbeBody
+      : agentFacingContent;
     const commandAuthorized = shouldComputeEffectiveCommandAuthorized
       ? isDirect && audioTranscript === undefined && effectiveDmIngress
         ? effectiveDmIngress.commandAccess.authorized
@@ -1113,7 +1119,12 @@ export async function handleFeishuMessage(params: {
                 senderUserId,
                 requireMention: false,
                 mentionedBot: true,
-                command: { hasControlCommand: true },
+                command: {
+                  hasControlCommand: true,
+                  ...(groupMentionCommandOwnerAllowFrom
+                    ? { commandOwnerAllowFrom: groupMentionCommandOwnerAllowFrom }
+                    : {}),
+                },
               })
             ).commandAccess.authorized
           : (
