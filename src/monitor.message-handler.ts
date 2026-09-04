@@ -48,6 +48,7 @@ type FeishuMessageReceiveHandlerContext = {
   resolveSequentialKey?: (params: {
     accountId: string;
     event: FeishuMessageEvent;
+    cfg?: ClawdbotConfig;
     botOpenId?: string;
     botName?: string;
   }) => string;
@@ -209,6 +210,7 @@ export function createFeishuMessageReceiveHandler({
     const sequentialKey = resolveSequentialKey({
       accountId,
       event,
+      cfg,
       botOpenId: getBotOpenId(accountId),
       botName: getBotName(accountId),
     });

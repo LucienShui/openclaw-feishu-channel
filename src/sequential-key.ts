@@ -3,6 +3,7 @@ import {
   isAbortRequestText,
   isBtwRequestText,
 } from "openclaw/plugin-sdk/command-primitives-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { parseFeishuMessageEvent, type FeishuMessageEvent } from "./bot.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { normalizeFeishuCommandProbeBody, resolveFeishuGroupSession } from "./bot-content.js";
@@ -12,7 +13,7 @@ import { isFeishuGroupChatType } from "./types.js";
 export function getFeishuSequentialKey(params: {
   accountId: string;
   event: FeishuMessageEvent;
-  cfg?: ClawdbotConfig;
+  cfg?: OpenClawConfig;
   botOpenId?: string;
   botName?: string;
 }): string {
